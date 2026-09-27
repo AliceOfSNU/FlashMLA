@@ -1,5 +1,7 @@
 #include "combine.h"
 
+#include <cstdlib>
+#include <type_traits>
 #include <math_constants.h>
 #include <cute/tensor.hpp>
 #include <cutlass/cutlass.h>
@@ -15,11 +17,17 @@ using namespace cute;
 
 namespace smxx::decode {
 
-template<typename ElementT, int HEAD_DIM_V, int BLOCK_SIZE_M, int MAX_SPLITS, int NUM_THREADS>
+template<typename ElementT, int HEAD_DIM_V, int BLOCK_SIZE_M, int MAX_SPLITS, int NUM_THREADS, int PREFETCH>
 __global__ void __launch_bounds__(NUM_THREADS)
 flash_fwd_mla_combine_kernel(__grid_constant__ const CombineParams params) {
     // grid_shape: [batch_size*s_q, 1, h_q/BLOCK_SIZE_M]
     // Each CTA gathers the activation of some heads from one batch, do scaling & accumulation, and save the result
+    // PREFETCH = number of splits' o_accum loads kept in flight per thread. The split
+    // loop is a serial chain (one L2/DRAM round trip per split with PREFETCH==1, the
+    // upstream behavior), which dominates combine latency at low batch where each
+    // request has many splits. Loads for different splits are independent -- only the
+    // accumulation is ordered -- so a PREFETCH-deep register ring hides that latency.
+    static_assert(PREFETCH >= 1);
     static_assert(NUM_THREADS/32 == BLOCK_SIZE_M); // The number of warps == block_size_m
     const int batch_s_q_idx = blockIdx.x;
     const int batch_idx = batch_s_q_idx / params.s_q;
@@ -62,10 +70,15 @@ flash_fwd_mla_combine_kernel(__grid_constant__ const CombineParams params) {
     static_assert(HEAD_DIM_V % (32*4) == 0);
     constexpr int ELEMS_PER_THREAD = HEAD_DIM_V / (32*4);
     float* oaccum_ptr = params.o_accum + start_split_idx*params.stride_o_accum_split + s_q_idx*params.stride_o_accum_s_q + (h_block_idx*BLOCK_SIZE_M + warp_idx)*params.stride_o_accum_h_q;
-    float4 datas[ELEMS_PER_THREAD];
+    float4 datas[PREFETCH][ELEMS_PER_THREAD];   // ring of in-flight splits, indexed by split % PREFETCH
     CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
-        datas[i] = *(float4*)(oaccum_ptr + lane_idx*4 + i*128); // NOTE We don't use __ldg here since it is incompatible with PDL
+    for (int p = 0; p < PREFETCH; ++p) {
+        if (p < my_num_splits) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
+                datas[p][i] = *(float4*)(oaccum_ptr + p*params.stride_o_accum_split + lane_idx*4 + i*128); // NOTE We don't use __ldg here since it is incompatible with PDL
+            }
+        }
     }
 
     // Warp #i gathers LseAccum for seq #i
@@ -127,21 +140,30 @@ flash_fwd_mla_combine_kernel(__grid_constant__ const CombineParams params) {
         for (int i = 0; i < ELEMS_PER_THREAD; ++i)
             result[i] = {0.0f, 0.0f, 0.0f, 0.0f};
 
+        // Splits are consumed in order (same fp summation order as upstream => bitwise
+        // identical output); after consuming split s from ring slot s%PREFETCH, that
+        // slot is refilled with split s+PREFETCH, keeping PREFETCH loads in flight.
+        // The inner p-loop is unrolled so ring indices are compile-time (registers).
         #pragma unroll 1
-        for (int split = 0; split < my_num_splits; ++split) {
-            float lse_scale = smem_buf[warp_idx][split];
-            // if (lse_scale != 0.f) {
+        for (int base = 0; base < my_num_splits; base += PREFETCH) {
             CUTLASS_PRAGMA_UNROLL
-            for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
-                result[i].x += lse_scale * datas[i].x;
-                result[i].y += lse_scale * datas[i].y;
-                result[i].z += lse_scale * datas[i].z;
-                result[i].w += lse_scale * datas[i].w;
-                if (split != my_num_splits-1) {
-                    datas[i] = *(float4*)(oaccum_ptr + (split+1)*params.stride_o_accum_split + lane_idx*4 + i*128);
+            for (int p = 0; p < PREFETCH; ++p) {
+                const int split = base + p;
+                if (split < my_num_splits) {
+                    float lse_scale = smem_buf[warp_idx][split];
+                    const int next = split + PREFETCH;
+                    CUTLASS_PRAGMA_UNROLL
+                    for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
+                        result[i].x += lse_scale * datas[p][i].x;
+                        result[i].y += lse_scale * datas[p][i].y;
+                        result[i].z += lse_scale * datas[p][i].z;
+                        result[i].w += lse_scale * datas[p][i].w;
+                        if (next < my_num_splits) {
+                            datas[p][i] = *(float4*)(oaccum_ptr + next*params.stride_o_accum_split + lane_idx*4 + i*128);
+                        }
+                    }
                 }
             }
-            // }
         }
         
         const int h_q_idx = h_block_idx*BLOCK_SIZE_M + warp_idx;
@@ -198,25 +220,41 @@ template<typename ElementT>
 void run_flash_mla_combine_kernel(CombineParams &params) {
     static constexpr int HEAD_DIM_V = 512;  // Since only this head dimension is supported by Flash MLA
     FLASH_ASSERT(params.d_v == HEAD_DIM_V);
+    // Prefetch depth: FLASH_MLA_COMBINE_PREFETCH in {1,2,4,8}; 1 == the upstream loop.
+    // Read once per process. Unset/other -> 4.
+    static const int prefetch = [] {
+        const char* e = getenv("FLASH_MLA_COMBINE_PREFETCH");
+        const int v = e ? atoi(e) : 4;
+        return (v == 1 || v == 2 || v == 4 || v == 8) ? v : 4;
+    }();
     MLA_NUM_SPLITS_SWITCH(params.num_sm_parts, NUM_SPLITS, [&] {
         constexpr int BLOCK_SIZE_M = 8;
         constexpr int NUM_THREADS = BLOCK_SIZE_M*32;
         constexpr size_t smem_size = BLOCK_SIZE_M*(NUM_SPLITS+1)*sizeof(float);
-        auto combine_kernel = &flash_fwd_mla_combine_kernel<ElementT, HEAD_DIM_V, BLOCK_SIZE_M, NUM_SPLITS, NUM_THREADS>;
-        CHECK_CUDA(cudaFuncSetAttribute(combine_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-        // Use cudaLaunchKernelEx to enable PDL (Programmatic Dependent Launch)
-        cudaLaunchAttribute attribute[1];
-        attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attribute[0].val.programmaticStreamSerializationAllowed = 1;
-        cudaLaunchConfig_t combine_kernel_config = {
-            dim3(params.b * params.s_q, 1, ku::ceil_div(params.h_q, BLOCK_SIZE_M)),
-            dim3(NUM_THREADS, 1, 1),
-            0,
-            params.stream,
-            attribute,
-            1
+        auto launch = [&](auto prefetch_ic) {
+            constexpr int PREFETCH = decltype(prefetch_ic)::value;
+            auto combine_kernel = &flash_fwd_mla_combine_kernel<ElementT, HEAD_DIM_V, BLOCK_SIZE_M, NUM_SPLITS, NUM_THREADS, PREFETCH>;
+            CHECK_CUDA(cudaFuncSetAttribute(combine_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+            // Use cudaLaunchKernelEx to enable PDL (Programmatic Dependent Launch)
+            cudaLaunchAttribute attribute[1];
+            attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+            attribute[0].val.programmaticStreamSerializationAllowed = 1;
+            cudaLaunchConfig_t combine_kernel_config = {
+                dim3(params.b * params.s_q, 1, ku::ceil_div(params.h_q, BLOCK_SIZE_M)),
+                dim3(NUM_THREADS, 1, 1),
+                0,
+                params.stream,
+                attribute,
+                1
+            };
+            CHECK_CUDA(cudaLaunchKernelEx(&combine_kernel_config, combine_kernel, params));
         };
-        CHECK_CUDA(cudaLaunchKernelEx(&combine_kernel_config, combine_kernel, params));
+        switch (prefetch) {
+            case 1: launch(std::integral_constant<int, 1>{}); break;
+            case 2: launch(std::integral_constant<int, 2>{}); break;
+            case 8: launch(std::integral_constant<int, 8>{}); break;
+            default: launch(std::integral_constant<int, 4>{}); break;
+        }
     });
     CHECK_CUDA_KERNEL_LAUNCH();
 }
