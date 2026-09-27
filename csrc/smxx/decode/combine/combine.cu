@@ -1,5 +1,6 @@
 #include "combine.h"
 
+#include <type_traits>
 #include <math_constants.h>
 #include <cute/tensor.hpp>
 #include <cutlass/cutlass.h>
@@ -15,11 +16,17 @@ using namespace cute;
 
 namespace smxx::decode {
 
-template<typename ElementT, int HEAD_DIM_V, int BLOCK_SIZE_M, int MAX_SPLITS, int NUM_THREADS>
+template<typename ElementT, int HEAD_DIM_V, int BLOCK_SIZE_M, int MAX_SPLITS, int NUM_THREADS, int N_DCHUNK>
 __global__ void __launch_bounds__(NUM_THREADS)
 flash_fwd_mla_combine_kernel(__grid_constant__ const CombineParams params) {
-    // grid_shape: [batch_size*s_q, 1, h_q/BLOCK_SIZE_M]
-    // Each CTA gathers the activation of some heads from one batch, do scaling & accumulation, and save the result
+    // grid_shape: [batch_size*s_q, N_DCHUNK, h_q/BLOCK_SIZE_M]
+    // Each CTA gathers the activation of some heads from one batch, do scaling & accumulation, and save the result.
+    // blockIdx.y (N_DCHUNK-way) partitions the HEAD_DIM_V output across CTAs so that at
+    // low batch -- where grid.x*grid.z is far below the SM count -- the merge is spread
+    // over more CTAs to fill idle SMs. Each CTA owns a 512/N_DCHUNK slice of every head's
+    // output; the per-split lse scales are head-only (D-independent) so they are just
+    // recomputed per chunk (cheap). No cross-CTA reduction, single launch. N_DCHUNK==1 is
+    // byte-for-byte the upstream kernel.
     static_assert(NUM_THREADS/32 == BLOCK_SIZE_M); // The number of warps == block_size_m
     const int batch_s_q_idx = blockIdx.x;
     const int batch_idx = batch_s_q_idx / params.s_q;
@@ -27,6 +34,9 @@ flash_fwd_mla_combine_kernel(__grid_constant__ const CombineParams params) {
     const int h_block_idx = blockIdx.z;
     const int warp_idx = threadIdx.x / 32;
     const int lane_idx = threadIdx.x % 32;
+    constexpr int HEAD_DIM_PER_CTA = HEAD_DIM_V / N_DCHUNK;
+    const int dchunk = blockIdx.y;                 // which head_dim slice this CTA owns
+    const int d_offset = dchunk * HEAD_DIM_PER_CTA; // element offset into the (unit-stride) head_dim
 
     int num_valid_heads = std::min(BLOCK_SIZE_M, params.h_q - BLOCK_SIZE_M*h_block_idx);
     if (warp_idx >= num_valid_heads) {
@@ -59,9 +69,9 @@ flash_fwd_mla_combine_kernel(__grid_constant__ const CombineParams params) {
     cudaGridDependencySynchronize();
 
     // Prefetch
-    static_assert(HEAD_DIM_V % (32*4) == 0);
-    constexpr int ELEMS_PER_THREAD = HEAD_DIM_V / (32*4);
-    float* oaccum_ptr = params.o_accum + start_split_idx*params.stride_o_accum_split + s_q_idx*params.stride_o_accum_s_q + (h_block_idx*BLOCK_SIZE_M + warp_idx)*params.stride_o_accum_h_q;
+    static_assert(HEAD_DIM_PER_CTA % (32*4) == 0);
+    constexpr int ELEMS_PER_THREAD = HEAD_DIM_PER_CTA / (32*4);
+    float* oaccum_ptr = params.o_accum + start_split_idx*params.stride_o_accum_split + s_q_idx*params.stride_o_accum_s_q + (h_block_idx*BLOCK_SIZE_M + warp_idx)*params.stride_o_accum_h_q + d_offset;
     float4 datas[ELEMS_PER_THREAD];
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
@@ -96,7 +106,7 @@ flash_fwd_mla_combine_kernel(__grid_constant__ const CombineParams params) {
             sum_lse = sum_lse + __shfl_xor_sync(uint32_t(-1), sum_lse, offset);
 
         float global_lse = (sum_lse == 0.f || sum_lse == -INFINITY) ? INFINITY : log2f(sum_lse) + max_lse;
-        if (lane_idx == 0)
+        if (lane_idx == 0 && dchunk == 0)  // gLse is head-only; only one D-chunk need write it
             gLse(warp_idx) = global_lse / (float)M_LOG2E;
         
         if (params.attn_sink != nullptr) {
@@ -145,7 +155,7 @@ flash_fwd_mla_combine_kernel(__grid_constant__ const CombineParams params) {
         }
         
         const int h_q_idx = h_block_idx*BLOCK_SIZE_M + warp_idx;
-        ElementT* o_ptr = (ElementT*)params.out + batch_idx*params.stride_o_b + s_q_idx*params.stride_o_s_q + h_q_idx*params.stride_o_h_q;
+        ElementT* o_ptr = (ElementT*)params.out + batch_idx*params.stride_o_b + s_q_idx*params.stride_o_s_q + h_q_idx*params.stride_o_h_q + d_offset;
 
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
@@ -198,25 +208,50 @@ template<typename ElementT>
 void run_flash_mla_combine_kernel(CombineParams &params) {
     static constexpr int HEAD_DIM_V = 512;  // Since only this head dimension is supported by Flash MLA
     FLASH_ASSERT(params.d_v == HEAD_DIM_V);
+
+    // Fan the merge over N_DCHUNK head_dim slices to fill idle SMs at low batch. The
+    // upstream grid.x*grid.z = (b*s_q)*ceil(h_q/8) is far below the SM count at low batch,
+    // leaving most SMs idle while each CTA serially loops all splits. Pick N_DCHUNK in
+    // {1,2,4} (512/N_DCHUNK must stay a multiple of 128 for the float4 path) so the grid
+    // just reaches the SM count; N_DCHUNK==1 (high batch) is exactly the upstream launch.
+    static const int num_sms = [] {
+        int dev = 0, n = 1;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev);
+        return n;
+    }();
+    const int base_grid = params.b * params.s_q * ku::ceil_div(params.h_q, 8);
+    int ndchunk = 1;
+    if (base_grid > 0) {
+        const int want = ku::ceil_div(num_sms, base_grid);
+        ndchunk = want >= 4 ? 4 : (want >= 2 ? 2 : 1);
+    }
+
     MLA_NUM_SPLITS_SWITCH(params.num_sm_parts, NUM_SPLITS, [&] {
         constexpr int BLOCK_SIZE_M = 8;
         constexpr int NUM_THREADS = BLOCK_SIZE_M*32;
         constexpr size_t smem_size = BLOCK_SIZE_M*(NUM_SPLITS+1)*sizeof(float);
-        auto combine_kernel = &flash_fwd_mla_combine_kernel<ElementT, HEAD_DIM_V, BLOCK_SIZE_M, NUM_SPLITS, NUM_THREADS>;
-        CHECK_CUDA(cudaFuncSetAttribute(combine_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-        // Use cudaLaunchKernelEx to enable PDL (Programmatic Dependent Launch)
-        cudaLaunchAttribute attribute[1];
-        attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attribute[0].val.programmaticStreamSerializationAllowed = 1;
-        cudaLaunchConfig_t combine_kernel_config = {
-            dim3(params.b * params.s_q, 1, ku::ceil_div(params.h_q, BLOCK_SIZE_M)),
-            dim3(NUM_THREADS, 1, 1),
-            0,
-            params.stream,
-            attribute,
-            1
+        auto launch = [&](auto ndchunk_ic) {
+            constexpr int N_DCHUNK = decltype(ndchunk_ic)::value;
+            auto combine_kernel = &flash_fwd_mla_combine_kernel<ElementT, HEAD_DIM_V, BLOCK_SIZE_M, NUM_SPLITS, NUM_THREADS, N_DCHUNK>;
+            CHECK_CUDA(cudaFuncSetAttribute(combine_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+            // Use cudaLaunchKernelEx to enable PDL (Programmatic Dependent Launch)
+            cudaLaunchAttribute attribute[1];
+            attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+            attribute[0].val.programmaticStreamSerializationAllowed = 1;
+            cudaLaunchConfig_t combine_kernel_config = {
+                dim3(params.b * params.s_q, N_DCHUNK, ku::ceil_div(params.h_q, BLOCK_SIZE_M)),
+                dim3(NUM_THREADS, 1, 1),
+                0,
+                params.stream,
+                attribute,
+                1
+            };
+            CHECK_CUDA(cudaLaunchKernelEx(&combine_kernel_config, combine_kernel, params));
         };
-        CHECK_CUDA(cudaLaunchKernelEx(&combine_kernel_config, combine_kernel, params));
+        if (ndchunk == 4) launch(std::integral_constant<int, 4>{});
+        else if (ndchunk == 2) launch(std::integral_constant<int, 2>{});
+        else launch(std::integral_constant<int, 1>{});
     });
     CHECK_CUDA_KERNEL_LAUNCH();
 }
