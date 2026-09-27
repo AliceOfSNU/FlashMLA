@@ -1,6 +1,7 @@
 #include "combine.h"
 
 #include <type_traits>
+#include <cstdlib>
 #include <math_constants.h>
 #include <cute/tensor.hpp>
 #include <cutlass/cutlass.h>
@@ -226,6 +227,14 @@ void run_flash_mla_combine_kernel(CombineParams &params) {
         const int want = ku::ceil_div(num_sms, base_grid);
         ndchunk = want >= 4 ? 4 : (want >= 2 ? 2 : 1);
     }
+    // Override for A/B benchmarking / safety: FLASH_MLA_COMBINE_NDCHUNK=1 forces the
+    // exact upstream single-launch behavior; 2 or 4 pins the fan-out. Unset/0 = auto.
+    static const int forced_ndchunk = [] {
+        const char* e = getenv("FLASH_MLA_COMBINE_NDCHUNK");
+        return e ? atoi(e) : 0;
+    }();
+    if (forced_ndchunk == 1 || forced_ndchunk == 2 || forced_ndchunk == 4)
+        ndchunk = forced_ndchunk;
 
     MLA_NUM_SPLITS_SWITCH(params.num_sm_parts, NUM_SPLITS, [&] {
         constexpr int BLOCK_SIZE_M = 8;
