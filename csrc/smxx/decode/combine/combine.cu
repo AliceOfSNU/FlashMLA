@@ -71,12 +71,21 @@ flash_fwd_mla_combine_kernel(__grid_constant__ const CombineParams params) {
     constexpr int ELEMS_PER_THREAD = HEAD_DIM_V / (32*4);
     float* oaccum_ptr = params.o_accum + start_split_idx*params.stride_o_accum_split + s_q_idx*params.stride_o_accum_s_q + (h_block_idx*BLOCK_SIZE_M + warp_idx)*params.stride_o_accum_h_q;
     float4 datas[PREFETCH][ELEMS_PER_THREAD];   // ring of in-flight splits, indexed by split % PREFETCH
-    CUTLASS_PRAGMA_UNROLL
-    for (int p = 0; p < PREFETCH; ++p) {
-        if (p < my_num_splits) {
-            CUTLASS_PRAGMA_UNROLL
-            for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
-                datas[p][i] = *(float4*)(oaccum_ptr + p*params.stride_o_accum_split + lane_idx*4 + i*128); // NOTE We don't use __ldg here since it is incompatible with PDL
+    if constexpr (PREFETCH == 1) {
+        // Upstream prologue, unchanged: the restructured ring compiled to a measurably
+        // slower kernel at depth 1, so depth 1 keeps the original code path.
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
+            datas[0][i] = *(float4*)(oaccum_ptr + lane_idx*4 + i*128); // NOTE We don't use __ldg here since it is incompatible with PDL
+        }
+    } else {
+        CUTLASS_PRAGMA_UNROLL
+        for (int p = 0; p < PREFETCH; ++p) {
+            if (p < my_num_splits) {
+                CUTLASS_PRAGMA_UNROLL
+                for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
+                    datas[p][i] = *(float4*)(oaccum_ptr + p*params.stride_o_accum_split + lane_idx*4 + i*128); // NOTE We don't use __ldg here since it is incompatible with PDL
+                }
             }
         }
     }
@@ -140,26 +149,44 @@ flash_fwd_mla_combine_kernel(__grid_constant__ const CombineParams params) {
         for (int i = 0; i < ELEMS_PER_THREAD; ++i)
             result[i] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-        // Splits are consumed in order (same fp summation order as upstream => bitwise
-        // identical output); after consuming split s from ring slot s%PREFETCH, that
-        // slot is refilled with split s+PREFETCH, keeping PREFETCH loads in flight.
-        // The inner p-loop is unrolled so ring indices are compile-time (registers).
-        #pragma unroll 1
-        for (int base = 0; base < my_num_splits; base += PREFETCH) {
-            CUTLASS_PRAGMA_UNROLL
-            for (int p = 0; p < PREFETCH; ++p) {
-                const int split = base + p;
-                if (split < my_num_splits) {
-                    float lse_scale = smem_buf[warp_idx][split];
-                    const int next = split + PREFETCH;
-                    CUTLASS_PRAGMA_UNROLL
-                    for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
-                        result[i].x += lse_scale * datas[p][i].x;
-                        result[i].y += lse_scale * datas[p][i].y;
-                        result[i].z += lse_scale * datas[p][i].z;
-                        result[i].w += lse_scale * datas[p][i].w;
-                        if (next < my_num_splits) {
-                            datas[p][i] = *(float4*)(oaccum_ptr + next*params.stride_o_accum_split + lane_idx*4 + i*128);
+        if constexpr (PREFETCH == 1) {
+            // Upstream accumulation loop, unchanged (see the prologue note).
+            #pragma unroll 1
+            for (int split = 0; split < my_num_splits; ++split) {
+                float lse_scale = smem_buf[warp_idx][split];
+                CUTLASS_PRAGMA_UNROLL
+                for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
+                    result[i].x += lse_scale * datas[0][i].x;
+                    result[i].y += lse_scale * datas[0][i].y;
+                    result[i].z += lse_scale * datas[0][i].z;
+                    result[i].w += lse_scale * datas[0][i].w;
+                    if (split != my_num_splits-1) {
+                        datas[0][i] = *(float4*)(oaccum_ptr + (split+1)*params.stride_o_accum_split + lane_idx*4 + i*128);
+                    }
+                }
+            }
+        } else {
+            // Splits are consumed in order (same fp summation order as upstream => bitwise
+            // identical output); after consuming split s from ring slot s%PREFETCH, that
+            // slot is refilled with split s+PREFETCH, keeping PREFETCH loads in flight.
+            // The inner p-loop is unrolled so ring indices are compile-time (registers).
+            #pragma unroll 1
+            for (int base = 0; base < my_num_splits; base += PREFETCH) {
+                CUTLASS_PRAGMA_UNROLL
+                for (int p = 0; p < PREFETCH; ++p) {
+                    const int split = base + p;
+                    if (split < my_num_splits) {
+                        float lse_scale = smem_buf[warp_idx][split];
+                        const int next = split + PREFETCH;
+                        CUTLASS_PRAGMA_UNROLL
+                        for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
+                            result[i].x += lse_scale * datas[p][i].x;
+                            result[i].y += lse_scale * datas[p][i].y;
+                            result[i].z += lse_scale * datas[p][i].z;
+                            result[i].w += lse_scale * datas[p][i].w;
+                            if (next < my_num_splits) {
+                                datas[p][i] = *(float4*)(oaccum_ptr + next*params.stride_o_accum_split + lane_idx*4 + i*128);
+                            }
                         }
                     }
                 }
