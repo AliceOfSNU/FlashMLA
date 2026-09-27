@@ -220,13 +220,28 @@ template<typename ElementT>
 void run_flash_mla_combine_kernel(CombineParams &params) {
     static constexpr int HEAD_DIM_V = 512;  // Since only this head dimension is supported by Flash MLA
     FLASH_ASSERT(params.d_v == HEAD_DIM_V);
-    // Prefetch depth: FLASH_MLA_COMBINE_PREFETCH in {1,2,4,8}; 1 == the upstream loop.
-    // Read once per process. Unset/other -> 4.
-    static const int prefetch = [] {
+    // Prefetch depth. A deep ring hides the per-split latency chain that dominates when
+    // the grid is small (low batch: few CTAs, many splits each), but its registers cut
+    // occupancy, which hurts once the grid is several waves of mostly 1-split CTAs
+    // (high batch). Measured on B200 (h_q=64, s_q=2): depth 8 best while the grid fits
+    // in one wave, 4 up to two waves, and the upstream loop (1) beyond that.
+    // FLASH_MLA_COMBINE_PREFETCH in {1,2,4,8} forces a depth (1 == upstream); unset = auto.
+    static const int forced_prefetch = [] {
         const char* e = getenv("FLASH_MLA_COMBINE_PREFETCH");
-        const int v = e ? atoi(e) : 4;
-        return (v == 1 || v == 2 || v == 4 || v == 8) ? v : 4;
+        const int v = e ? atoi(e) : 0;
+        return (v == 1 || v == 2 || v == 4 || v == 8) ? v : 0;
     }();
+    static const int num_sms = [] {
+        int dev = 0, n = 1;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev);
+        return n;
+    }();
+    const int grid_ctas = params.b * params.s_q * ku::ceil_div(params.h_q, 8);
+    const int prefetch = forced_prefetch != 0 ? forced_prefetch
+                       : grid_ctas <= num_sms     ? 8
+                       : grid_ctas <= 2 * num_sms ? 4
+                       : 1;
     MLA_NUM_SPLITS_SWITCH(params.num_sm_parts, NUM_SPLITS, [&] {
         constexpr int BLOCK_SIZE_M = 8;
         constexpr int NUM_THREADS = BLOCK_SIZE_M*32;
